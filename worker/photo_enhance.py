@@ -191,7 +191,8 @@ def run_job(job_id: str) -> None:
     try:
         opts = job.get("options") or {}
         style = str(opts.get("style", "general_hd"))
-        outscale = 4 if int(opts.get("scale", 2)) >= 4 else 2
+        raw_sc = int(opts.get("scale", 2))
+        outscale = 4 if raw_sc >= 4 else (1 if raw_sc <= 1 else 2)
         face_enhance = bool(opts.get("faceEnhance", True))
         out_fmt = "png" if str(opts.get("format", "jpg")).lower() == "png" else "jpg"
         ext = ".png" if out_fmt == "png" else ".jpg"

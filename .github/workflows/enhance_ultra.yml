@@ -1,0 +1,35 @@
+name: Ultra AI Photo Enhancer (GPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job ID from Vercel API"
+        required: true
+        type: string
+
+jobs:
+  enhance-ultra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight client dependencies
+        run: pip install --no-cache-dir gradio_client pillow boto3
+
+      - name: Run Ultra AI Photo Enhancer
+        env:
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python worker/photo_enhance_ultra.py --job-id "${{ inputs.job_id }}"
