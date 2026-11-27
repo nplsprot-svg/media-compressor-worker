@@ -116,17 +116,17 @@ def run_job(job_id: str) -> None:
             client = Client(SPACE_ID, token=hf_token)
             res = client.predict(
                 input_image=handle_file(str(prep_path)),
-                prompt="masterpiece, best quality, ultra sharp, clean edges, natural detailed texture, realistic hands and face",
-                negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, deformed, lowres",
+                prompt="sharp focus, clean anti-aliased edges, faithful high resolution restoration",
+                negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, hallucinated objects, lowres",
                 seed=42,
                 upscale_factor=gpu_upscale,
-                controlnet_scale=0.65,
+                controlnet_scale=0.92,
                 controlnet_decay=1.0,
-                condition_scale=6,
+                condition_scale=3.5,
                 tile_width=112,
                 tile_height=144,
-                denoise_strength=0.35,
-                num_inference_steps=18,
+                denoise_strength=0.16,
+                num_inference_steps=20,
                 solver="DDIM",
                 api_name="/process",
             )
