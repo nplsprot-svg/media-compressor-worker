@@ -73,6 +73,7 @@ def process_item(src_path: Path, out_dir: Path, mode: str, opts: dict, progress_
             preset=str(opts.get("preset", "medium")),
             max_height=int(opts.get("maxHeight", 0)),
             max_fps=int(opts.get("maxFps", 0)),
+            smooth_60fps=bool(opts.get("smooth60fps", False)),
             audio_mode=str(opts.get("audioMode", "aac96")),
             trim_start=str(opts.get("trimStart", "")),
             trim_end=str(opts.get("trimEnd", "")),

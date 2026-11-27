@@ -48,6 +48,7 @@ class VideoConfig:
     preset: str = "medium"
     max_height: int = 0
     max_fps: int = 0
+    smooth_60fps: bool = False
     audio_mode: str = "aac96"
     trim_start: str = ""
     trim_end: str = ""
@@ -191,7 +192,11 @@ def build_base_vf_list(info: VideoInfo, cfg: VideoConfig) -> list[str]:
         spd = max(0.5, min(2.0, spd))
         filters.append(f"setpts=PTS/{spd:.4f}")
 
-    if cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
+    if cfg.smooth_60fps:
+        # Motion-compensated optical flow interpolation to smooth 60fps (skips if already ~60fps).
+        if info.fps <= 0 or info.fps < 55.0:
+            filters.append("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+    elif cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
         filters.append(f"fps={cfg.max_fps}")
 
     return filters
@@ -419,6 +424,8 @@ def compress_one(
             note += f" (maks {cfg.max_height}p)"
         if abs(spd - 1.0) > 0.01:
             note += f" {spd:g}x"
+        if cfg.smooth_60fps:
+            note += " + Smooth 60fps"
         if trim_args:
             note += " + dipotong"
 
