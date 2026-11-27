@@ -119,11 +119,26 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
             Image.Resampling.LANCZOS,
         )
 
-    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    target_w = pil_img.width * outscale
+    target_h = pil_img.height * outscale
 
-    # Subtle edge-preserving bilateral smooth before neural 4x reconstruction suppresses game/JPEG jaggies.
-    if style in ("anime", "general_hd"):
-        bgr = cv2.bilateralFilter(bgr, d=5, sigmaColor=22, sigmaSpace=22)
+    # Sub-pixel pre-AA melts hard 1px game stair-steps into smooth slopes before 4x neural reconstruction.
+    work_img = pil_img
+    effective_outscale = outscale
+    if style == "anime":
+        aa_w = max(64, round(pil_img.width * 0.72))
+        aa_h = max(64, round(pil_img.height * 0.72))
+        work_img = pil_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
+        effective_outscale = 4
+    elif style == "general_hd":
+        aa_w = max(64, round(pil_img.width * 0.85))
+        aa_h = max(64, round(pil_img.height * 0.85))
+        work_img = pil_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
+        effective_outscale = 4
+
+    bgr = cv2.cvtColor(np.array(work_img), cv2.COLOR_RGB2BGR)
+    if style == "anime":
+        bgr = cv2.GaussianBlur(bgr, (3, 3), 0.55)
 
     upsampler = build_upsampler(style)
 
@@ -131,7 +146,7 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
         gfp_path = ensure_weight(GFPGAN_MODEL["filename"], GFPGAN_MODEL["url"])
         restorer = GFPGANer(
             model_path=str(gfp_path),
-            upscale=outscale,
+            upscale=effective_outscale,
             arch="clean",
             channel_multiplier=2,
             bg_upsampler=upsampler,
@@ -145,10 +160,13 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
             weight=0.55,
         )
     else:
-        output_bgr, _ = upsampler.enhance(bgr, outscale=outscale)
+        output_bgr, _ = upsampler.enhance(bgr, outscale=effective_outscale)
 
     rgb_out = cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
     out_img = Image.fromarray(rgb_out)
+    # Supersample down to exact target 2x/4x dimensions for silky-smooth anti-aliased edges.
+    if out_img.size != (target_w, target_h):
+        out_img = out_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     save_kwargs = {"icc_profile": icc} if icc else {}
     if out_fmt == "png":
