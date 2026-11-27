@@ -1,0 +1,36 @@
+name: Compress Media Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job ID from Vercel API"
+        required: true
+        type: string
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install --no-cache-dir pillow boto3
+
+      - name: Run compression job
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python worker/run_job.py --job-id "${{ inputs.job_id }}"

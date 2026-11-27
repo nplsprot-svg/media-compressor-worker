@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""GitHub Actions worker: downloads input from R2, runs photo/video compression, uploads result."""
+
+from datetime import datetime, timezone
+from pathlib import Path
+import argparse
+import json
+import os
+import sys
+import tempfile
+
+import boto3
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import photo_compress as pc
+import video_compress as vc
+
+
+def make_r2_client():
+    account_id = os.environ["R2_ACCOUNT_ID"]
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
+
+
+def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
+    payload["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    s3.put_object(
+        Bucket=bucket,
+        Key=f"jobs/{job_id}/status.json",
+        Body=json.dumps(payload).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def run_job(job_id: str) -> None:
+    bucket = os.environ["R2_BUCKET"]
+    s3 = make_r2_client()
+    status_key = f"jobs/{job_id}/status.json"
+
+    raw = s3.get_object(Bucket=bucket, Key=status_key)["Body"].read()
+    job = json.loads(raw.decode("utf-8"))
+    job["status"] = "processing"
+    write_status(s3, bucket, job_id, job)
+
+    try:
+        opts = job.get("options") or {}
+        mode = job["mode"]
+        input_key = job["inputKey"]
+        filename = Path(input_key).name
+
+        with tempfile.TemporaryDirectory(prefix=f"job_{job_id}_") as td:
+            work = Path(td)
+            src_path = work / filename
+            out_dir = work / "out"
+            out_dir.mkdir()
+
+            s3.download_file(bucket, input_key, str(src_path))
+
+            if mode == "photo":
+                cfg = pc.CompressConfig(
+                    output_format=str(opts.get("format", "keep")),
+                    quality=int(opts.get("quality", 85)),
+                    target_kb=int(opts.get("targetKb", 0)),
+                    max_side=int(opts.get("maxSide", 0)),
+                    resample=str(opts.get("resample", "lanczos"))
+                    if str(opts.get("resample", "lanczos")) in pc.RESAMPLE_FILTERS
+                    else "lanczos",
+                    sharpen_after_resize=bool(opts.get("sharpen", True)),
+                    jpeg_subsampling=str(opts.get("subsampling", "4:2:0")),
+                    png_quantize=bool(opts.get("pngQuantize", False)),
+                    strip_exif=bool(opts.get("stripExif", True)),
+                    keep_icc=True,
+                    skip_if_larger=True,
+                )
+                outcome = pc.compress_one(src_path, out_dir, cfg)
+            elif mode == "video":
+                cfg = vc.VideoConfig(
+                    codec=str(opts.get("codec", "h264")),
+                    crf=int(opts.get("crf", 23)),
+                    target_mb=float(opts.get("targetMb", 0)),
+                    preset=str(opts.get("preset", "medium")),
+                    max_height=int(opts.get("maxHeight", 0)),
+                    max_fps=int(opts.get("maxFps", 0)),
+                    audio_mode=str(opts.get("audioMode", "aac128")),
+                    strip_metadata=True,
+                    faststart=True,
+                    skip_if_larger=True,
+                )
+                outcome = vc.compress_one(src_path, out_dir, cfg, show_progress=False)
+            else:
+                raise ValueError(f"Mode tidak dikenal: {mode}")
+
+            if outcome.status == "error" or outcome.dst is None:
+                raise RuntimeError(outcome.detail or "Kompresi gagal")
+
+            out_name = outcome.dst.name
+            output_key = f"jobs/{job_id}/output/{out_name}"
+            s3.upload_file(str(outcome.dst), bucket, output_key)
+
+            job.update(
+                {
+                    "status": "done",
+                    "outputKey": output_key,
+                    "outputName": out_name,
+                    "origBytes": outcome.orig_bytes,
+                    "newBytes": outcome.new_bytes,
+                    "detail": outcome.detail,
+                }
+            )
+            write_status(s3, bucket, job_id, job)
+    except Exception as exc:
+        job.update({"status": "error", "error": str(exc)})
+        write_status(s3, bucket, job_id, job)
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--job-id", required=True)
+    args = parser.parse_args()
+    run_job(args.job_id)
+
+
+if __name__ == "__main__":
+    main()
