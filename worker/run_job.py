@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub Actions worker: downloads input from S3/Backblaze B2, runs photo/video compression, uploads result."""
+"""Media compression worker: downloads input from S3/B2, streams progress, uploads compressed output."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import boto3
 from botocore.config import Config
@@ -19,16 +20,14 @@ import video_compress as vc
 
 def make_s3_client():
     endpoint = os.environ.get("S3_ENDPOINT", "").strip()
-    if not endpoint and os.environ.get("R2_ACCOUNT_ID"):
-        endpoint = f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
     if not endpoint.startswith("http"):
         endpoint = f"https://{endpoint}"
     return boto3.client(
         "s3",
         endpoint_url=endpoint,
-        aws_access_key_id=os.environ.get("S3_ACCESS_KEY_ID") or os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY") or os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name=os.environ.get("S3_REGION", "us-west-004"),
+        aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+        region_name=os.environ.get("S3_REGION", "us-east-005"),
         config=Config(signature_version="s3v4"),
     )
 
@@ -44,14 +43,29 @@ def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
 
 
 def run_job(job_id: str) -> None:
-    bucket = os.environ.get("S3_BUCKET") or os.environ["R2_BUCKET"]
+    bucket = os.environ["S3_BUCKET"]
     s3 = make_s3_client()
     status_key = f"jobs/{job_id}/status.json"
 
     raw = s3.get_object(Bucket=bucket, Key=status_key)["Body"].read()
     job = json.loads(raw.decode("utf-8"))
-    job["status"] = "processing"
+    job.update({"status": "processing", "progress": 2, "speed": ""})
     write_status(s3, bucket, job_id, job)
+
+    last_push = 0.0
+
+    def on_progress(pct: float, speed: str) -> None:
+        nonlocal last_push
+        now = time.monotonic()
+        if now - last_push < 3.0:
+            return
+        last_push = now
+        job["progress"] = round(min(99.0, max(1.0, pct)), 1)
+        job["speed"] = speed
+        try:
+            write_status(s3, bucket, job_id, job)
+        except Exception:
+            pass
 
     try:
         opts = job.get("options") or {}
@@ -86,18 +100,22 @@ def run_job(job_id: str) -> None:
                 outcome = pc.compress_one(src_path, out_dir, cfg)
             elif mode == "video":
                 cfg = vc.VideoConfig(
-                    codec=str(opts.get("codec", "h264")),
-                    crf=int(opts.get("crf", 23)),
+                    codec=str(opts.get("codec", "h265")),
+                    crf=int(opts.get("crf", 27)),
                     target_mb=float(opts.get("targetMb", 0)),
                     preset=str(opts.get("preset", "medium")),
                     max_height=int(opts.get("maxHeight", 0)),
                     max_fps=int(opts.get("maxFps", 0)),
                     audio_mode=str(opts.get("audioMode", "aac128")),
+                    trim_start=str(opts.get("trimStart", "")),
+                    trim_end=str(opts.get("trimEnd", "")),
+                    extract_audio=bool(opts.get("extractAudio", False)),
+                    audio_format=str(opts.get("audioFormat", "mp3")),
                     strip_metadata=True,
                     faststart=True,
                     skip_if_larger=True,
                 )
-                outcome = vc.compress_one(src_path, out_dir, cfg, show_progress=False)
+                outcome = vc.compress_one(src_path, out_dir, cfg, show_progress=False, progress_cb=on_progress)
             else:
                 raise ValueError(f"Mode tidak dikenal: {mode}")
 
@@ -108,7 +126,6 @@ def run_job(job_id: str) -> None:
             output_key = f"jobs/{job_id}/output/{out_name}"
             s3.upload_file(str(outcome.dst), bucket, output_key)
 
-            # Remove uploaded source file immediately to keep 10 GB free tier clean.
             try:
                 s3.delete_object(Bucket=bucket, Key=input_key)
             except Exception:
@@ -117,11 +134,13 @@ def run_job(job_id: str) -> None:
             job.update(
                 {
                     "status": "done",
+                    "progress": 100,
                     "outputKey": output_key,
                     "outputName": out_name,
                     "origBytes": outcome.orig_bytes,
                     "newBytes": outcome.new_bytes,
                     "detail": outcome.detail,
+                    "isAudioOnly": bool(mode == "video" and opts.get("extractAudio")),
                 }
             )
             write_status(s3, bucket, job_id, job)
