@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub Actions worker: downloads input from R2, runs photo/video compression, uploads result."""
+"""GitHub Actions worker: downloads input from S3/Backblaze B2, runs photo/video compression, uploads result."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,20 +10,26 @@ import sys
 import tempfile
 
 import boto3
+from botocore.config import Config
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import photo_compress as pc
 import video_compress as vc
 
 
-def make_r2_client():
-    account_id = os.environ["R2_ACCOUNT_ID"]
+def make_s3_client():
+    endpoint = os.environ.get("S3_ENDPOINT", "").strip()
+    if not endpoint and os.environ.get("R2_ACCOUNT_ID"):
+        endpoint = f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+    if not endpoint.startswith("http"):
+        endpoint = f"https://{endpoint}"
     return boto3.client(
         "s3",
-        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.environ.get("S3_ACCESS_KEY_ID") or os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY") or os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name=os.environ.get("S3_REGION", "us-west-004"),
+        config=Config(signature_version="s3v4"),
     )
 
 
@@ -38,8 +44,8 @@ def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
 
 
 def run_job(job_id: str) -> None:
-    bucket = os.environ["R2_BUCKET"]
-    s3 = make_r2_client()
+    bucket = os.environ.get("S3_BUCKET") or os.environ["R2_BUCKET"]
+    s3 = make_s3_client()
     status_key = f"jobs/{job_id}/status.json"
 
     raw = s3.get_object(Bucket=bucket, Key=status_key)["Body"].read()
@@ -101,6 +107,12 @@ def run_job(job_id: str) -> None:
             out_name = outcome.dst.name
             output_key = f"jobs/{job_id}/output/{out_name}"
             s3.upload_file(str(outcome.dst), bucket, output_key)
+
+            # Remove uploaded source file immediately to keep 10 GB free tier clean.
+            try:
+                s3.delete_object(Bucket=bucket, Key=input_key)
+            except Exception:
+                pass
 
             job.update(
                 {
