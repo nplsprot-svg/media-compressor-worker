@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI Photo HD Enhancer worker using Real-ESRGAN + GFPGAN v1.4 on CPU."""
+"""AI Photo HD Enhancer worker using Real-ESRGAN (x4plus / anime_6B) + GFPGAN v1.4 on CPU."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,19 +25,19 @@ WEIGHTS_DIR = Path(os.environ.get("AI_WEIGHTS_DIR", str(Path.home() / ".cache" /
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_REGISTRY = {
-    "general_fast": {
-        "filename": "realesr-general-x4v3.pth",
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
-        "netscale": 4,
-    },
     "general_hd": {
-        "filename": "RealESRGAN_x2plus.pth",
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
-        "netscale": 2,
+        "filename": "RealESRGAN_x4plus.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "netscale": 4,
     },
     "anime": {
         "filename": "RealESRGAN_x4plus_anime_6B.pth",
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        "netscale": 4,
+    },
+    "general_fast": {
+        "filename": "realesr-general-x4v3.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
         "netscale": 4,
     },
 }
@@ -83,22 +83,23 @@ def ensure_weight(filename: str, url: str) -> Path:
 
 
 def build_upsampler(style: str) -> RealESRGANer:
-    spec = MODEL_REGISTRY.get(style, MODEL_REGISTRY["general_fast"])
+    spec = MODEL_REGISTRY.get(style, MODEL_REGISTRY["general_hd"])
     w_path = ensure_weight(spec["filename"], spec["url"])
 
-    if style == "general_hd":
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-    elif style == "anime":
+    if style == "anime":
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
-    else:
+    elif style == "general_fast":
         model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu")
+    else:
+        # Full 23-block RRDBNet x4plus: smooths stair-step jaggies and reconstructs crisp edges.
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
 
     return RealESRGANer(
         scale=spec["netscale"],
         model_path=str(w_path),
         model=model,
         tile=400,
-        tile_pad=10,
+        tile_pad=16,
         pre_pad=0,
         half=False,
         device=torch.device("cpu"),
@@ -106,13 +107,11 @@ def build_upsampler(style: str) -> RealESRGANer:
 
 
 def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, face_enhance: bool, out_fmt: str) -> str:
-    # Normalize EXIF orientation before OpenCV processing
     with Image.open(src_path) as opened:
         icc = opened.info.get("icc_profile")
         pil_img = ImageOps.exif_transpose(opened).convert("RGB")
 
-    # Guard against massive camera originals so CPU runner finishes reliably within minutes
-    max_input = 1600 if outscale <= 2 else 1024
+    max_input = 1440 if outscale <= 2 else 1024
     if max(pil_img.size) > max_input:
         ratio = max_input / max(pil_img.size)
         pil_img = pil_img.resize(
@@ -121,6 +120,11 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
         )
 
     bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    # Subtle edge-preserving bilateral smooth before neural 4x reconstruction suppresses game/JPEG jaggies.
+    if style in ("anime", "general_hd"):
+        bgr = cv2.bilateralFilter(bgr, d=5, sigmaColor=22, sigmaSpace=22)
+
     upsampler = build_upsampler(style)
 
     if face_enhance and style != "anime":
@@ -138,7 +142,7 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
             has_aligned=False,
             only_center_face=False,
             paste_back=True,
-            weight=0.6,
+            weight=0.55,
         )
     else:
         output_bgr, _ = upsampler.enhance(bgr, outscale=outscale)
@@ -150,7 +154,7 @@ def enhance_photo(src_path: Path, out_path: Path, style: str, outscale: int, fac
     if out_fmt == "png":
         out_img.save(out_path, format="PNG", optimize=True, compress_level=6, **save_kwargs)
     else:
-        out_img.save(out_path, format="JPEG", quality=92, optimize=True, progressive=True, subsampling=0, **save_kwargs)
+        out_img.save(out_path, format="JPEG", quality=93, optimize=True, progressive=True, subsampling=0, **save_kwargs)
 
     face_note = " + perbaiki wajah" if (face_enhance and style != "anime") else ""
     return f"HD {outscale}x ({out_img.width}x{out_img.height}){face_note}"
@@ -168,11 +172,12 @@ def run_job(job_id: str) -> None:
 
     try:
         opts = job.get("options") or {}
-        style = str(opts.get("style", "general_fast"))
+        style = str(opts.get("style", "general_hd"))
         outscale = 4 if int(opts.get("scale", 2)) >= 4 else 2
         face_enhance = bool(opts.get("faceEnhance", True))
         out_fmt = "png" if str(opts.get("format", "jpg")).lower() == "png" else "jpg"
         ext = ".png" if out_fmt == "png" else ".jpg"
+        mime = "image/png" if out_fmt == "png" else "image/jpeg"
 
         items = job.get("items") or [{"inputKey": job["inputKey"], "filename": job.get("filename") or Path(job["inputKey"]).name}]
         item = items[0]
@@ -196,7 +201,7 @@ def run_job(job_id: str) -> None:
             write_status(s3, bucket, job_id, job)
 
             output_key = f"jobs/{job_id}/output/{out_name}"
-            s3.upload_file(str(out_path), bucket, output_key)
+            s3.upload_file(str(out_path), bucket, output_key, ExtraArgs={"ContentType": mime})
             new_bytes = out_path.stat().st_size
 
             job.update(
