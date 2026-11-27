@@ -12,7 +12,7 @@ import tempfile
 import boto3
 from botocore.config import Config
 from gradio_client import Client, handle_file
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 SPACE_ID = "finegrain/finegrain-image-enhancer"
 
@@ -105,6 +105,11 @@ def run_job(job_id: str) -> None:
                     (max(64, round(prep_img.width * ratio)), max(64, round(prep_img.height * ratio))),
                     Image.Resampling.LANCZOS,
                 )
+            # Micro pre-AA softens 1px stair-step jaggies (umbrella/pants edges) before ControlNet locks geometry.
+            aa_w = max(64, round(prep_img.width * 0.88))
+            aa_h = max(64, round(prep_img.height * 0.88))
+            prep_img = prep_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
+            prep_img = prep_img.filter(ImageFilter.GaussianBlur(radius=0.45))
             prep_path = work / "input_prep.png"
             prep_img.save(prep_path, format="PNG")
 
@@ -120,12 +125,12 @@ def run_job(job_id: str) -> None:
                 negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, hallucinated objects, lowres",
                 seed=42,
                 upscale_factor=gpu_upscale,
-                controlnet_scale=0.92,
+                controlnet_scale=0.84,
                 controlnet_decay=1.0,
-                condition_scale=3.5,
+                condition_scale=4.2,
                 tile_width=112,
                 tile_height=144,
-                denoise_strength=0.16,
+                denoise_strength=0.23,
                 num_inference_steps=20,
                 solver="DDIM",
                 api_name="/process",
