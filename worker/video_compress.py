@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HD video compressor powered by FFmpeg with live progress callback, trim, and audio extract."""
+"""HD video processor: CRF/2-pass compression, trim, crop, rotate, speed, audio extract, GIF & animated WebP."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +27,7 @@ def detect_encoders() -> set[str]:
         check=False,
     )
     found: set[str] = set()
-    for name in ("libx264", "libx265", "libvpx-vp9", "libsvtav1", "aac", "libopus", "libmp3lame"):
+    for name in ("libx264", "libx265", "libvpx-vp9", "libwebp", "aac", "libopus", "libmp3lame"):
         if f" {name} " in proc.stdout:
             found.add(name)
     return found
@@ -41,17 +41,21 @@ class VideoConfig:
     input_path: str = ""
     output_dir: str = ""
     overwrite: bool = False
-    codec: str = "h264"  # h264 | h265 | vp9
-    crf: int = 23
+    output_mode: str = "video"  # video | audio | gif | webp_anim
+    codec: str = "h265"
+    crf: int = 27
     target_mb: float = 0.0
     preset: str = "medium"
     max_height: int = 0
     max_fps: int = 0
-    audio_mode: str = "aac128"  # aac128 | aac96 | copy | mute
-    trim_start: str = ""  # e.g. "00:05" or "5"
-    trim_end: str = ""    # e.g. "00:30" or "30"
+    audio_mode: str = "aac96"
+    trim_start: str = ""
+    trim_end: str = ""
+    crop_ratio: str = "orig"  # orig | 9:16 | 1:1 | 16:9 | 4:5
+    rotate_deg: int = 0       # 0 | 90 | 180 | 270 clockwise
+    speed: float = 1.0        # 0.5 .. 2.0
     extract_audio: bool = False
-    audio_format: str = "mp3"  # mp3 | m4a
+    audio_format: str = "mp3"
     strip_metadata: bool = True
     faststart: bool = True
     recursive: bool = False
@@ -154,27 +158,59 @@ def probe_video(path: Path) -> VideoInfo:
     )
 
 
-def build_vf_chain(info: VideoInfo, cfg: VideoConfig) -> str | None:
+def build_base_vf_list(info: VideoInfo, cfg: VideoConfig) -> list[str]:
     filters: list[str] = []
+    deg = int(cfg.rotate_deg or 0) % 360
+    if deg == 90:
+        filters.append("transpose=1")
+    elif deg == 180:
+        filters.append("transpose=1,transpose=1")
+    elif deg == 270:
+        filters.append("transpose=2")
+
+    ratio_exprs = {
+        "9:16": ("9/16", "16/9"),
+        "1:1": ("1", "1"),
+        "16:9": ("16/9", "9/16"),
+        "4:5": ("4/5", "5/4"),
+    }
+    if cfg.crop_ratio in ratio_exprs:
+        r_wh, r_hw = ratio_exprs[cfg.crop_ratio]
+        filters.append(
+            f"crop='trunc(min(iw,ih*{r_wh})/2)*2':'trunc(min(ih,iw*{r_hw})/2)*2'"
+        )
+
     if cfg.max_height > 0:
         h = cfg.max_height
         filters.append(
             f"scale='if(gt(iw,ih),-2,min(iw,{h}))':'if(gt(iw,ih),min(ih,{h}),-2)':flags=lanczos"
         )
+
+    spd = float(cfg.speed or 1.0)
+    if abs(spd - 1.0) > 0.01:
+        spd = max(0.5, min(2.0, spd))
+        filters.append(f"setpts=PTS/{spd:.4f}")
+
     if cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
         filters.append(f"fps={cfg.max_fps}")
-    return ",".join(filters) if filters else None
+
+    return filters
 
 
 def build_audio_args(info: VideoInfo, cfg: VideoConfig) -> tuple[list[str], int]:
     if not info.has_audio or cfg.audio_mode == "mute":
         return ["-an"], 0
-    if cfg.audio_mode == "copy" and cfg.codec != "vp9":
+    spd = max(0.5, min(2.0, float(cfg.speed or 1.0)))
+    speed_changed = abs(spd - 1.0) > 0.01
+
+    if cfg.audio_mode == "copy" and cfg.codec != "vp9" and not speed_changed:
         return ["-c:a", "copy"], 128
+
     bitrate_k = 96 if cfg.audio_mode == "aac96" else 128
+    af_args = ["-af", f"atempo={spd:.4f}"] if speed_changed else []
     if cfg.codec == "vp9" and "libopus" in AVAILABLE_ENCODERS:
-        return ["-c:a", "libopus", "-b:a", f"{bitrate_k}k"], bitrate_k
-    return ["-c:a", "aac", "-b:a", f"{bitrate_k}k"], bitrate_k
+        return [*af_args, "-c:a", "libopus", "-b:a", f"{bitrate_k}k"], bitrate_k
+    return [*af_args, "-c:a", "aac", "-b:a", f"{bitrate_k}k"], bitrate_k
 
 
 def build_video_codec_args(cfg: VideoConfig, bitrate_k: int | None = None) -> list[str]:
@@ -254,7 +290,7 @@ def compress_one(
         t_start = parse_timestamp(cfg.trim_start)
         t_end = parse_timestamp(cfg.trim_end)
         if t_start is not None and t_end is not None and t_end <= t_start:
-            raise ValueError("Waktu selesai trim harus lebih besar dari waktu mulai")
+            raise ValueError("Waktu selesai potong harus lebih besar dari waktu mulai")
 
         trim_args: list[str] = []
         eff_duration = info.duration
@@ -267,36 +303,74 @@ def compress_one(
         elif t_start is not None and eff_duration > t_start:
             eff_duration = eff_duration - t_start
 
+        spd = max(0.5, min(2.0, float(cfg.speed or 1.0)))
+        if eff_duration > 0 and abs(spd - 1.0) > 0.01:
+            eff_duration = eff_duration / spd
+
+        mode = "audio" if cfg.extract_audio else (cfg.output_mode or "video")
         meta_args = ["-map_metadata", "-1"] if cfg.strip_metadata else []
 
-        # Audio-only extraction mode
-        if cfg.extract_audio:
+        # 1. Audio extraction mode
+        if mode == "audio":
             if not info.has_audio:
                 raise RuntimeError("Video ini tidak memiliki trek audio")
             a_fmt = "m4a" if cfg.audio_format == "m4a" else "mp3"
-            ext = f".{a_fmt}"
+            if a_fmt == "mp3" and "libmp3lame" in AVAILABLE_ENCODERS:
+                ext, a_enc = ".mp3", ["-c:a", "libmp3lame", "-q:a", "2"]
+            else:
+                ext, a_enc = ".m4a", ["-c:a", "aac", "-b:a", "192k"]
+            af_args = ["-af", f"atempo={spd:.4f}"] if abs(spd - 1.0) > 0.01 else []
             out_name = f"{src.stem}{ext}"
             dst = (src.parent / out_name) if cfg.overwrite else (dst_dir / out_name)
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp_dst = dst.with_name(f".{dst.stem}.tmp{ext}")
-
-            if a_fmt == "mp3" and "libmp3lame" in AVAILABLE_ENCODERS:
-                a_enc = ["-c:a", "libmp3lame", "-q:a", "2"]
-            else:
-                a_enc = ["-c:a", "aac", "-b:a", "192k"]
-                if a_fmt == "mp3":
-                    ext = ".m4a"
-                    out_name = f"{src.stem}.m4a"
-                    dst = (src.parent / out_name) if cfg.overwrite else (dst_dir / out_name)
-                    tmp_dst = dst.with_name(f".{dst.stem}.tmp.m4a")
-
-            cmd = [*trim_args, "-i", str(src), "-vn", *a_enc, *meta_args, str(tmp_dst)]
+            cmd = [*trim_args, "-i", str(src), "-vn", *af_args, *a_enc, *meta_args, str(tmp_dst)]
             run_ffmpeg_with_progress(cmd, eff_duration, src.name, show_progress, progress_cb)
             new_bytes = tmp_dst.stat().st_size
             tmp_dst.replace(dst)
             return VideoOutcome(src, dst, orig_bytes, new_bytes, "ok", f"Ekstrak audio ({ext.lstrip('.').upper()})")
 
-        vf = build_vf_chain(info, cfg)
+        # 2. Animated GIF mode
+        if mode == "gif":
+            base_vf = build_base_vf_list(info, VideoConfig(**{**cfg.__dict__, "max_height": 0, "max_fps": 0}))
+            gif_scale = "fps=12,scale='min(iw,480)':-2:flags=lanczos"
+            chain = ",".join([*base_vf, gif_scale])
+            vf_complex = f"{chain},split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3"
+            out_name = f"{src.stem}.gif"
+            dst = (src.parent / out_name) if cfg.overwrite else (dst_dir / out_name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dst = dst.with_name(f".{dst.stem}.tmp.gif")
+            cmd = [*trim_args, "-i", str(src), "-vf", vf_complex, "-an", "-loop", "0", str(tmp_dst)]
+            run_ffmpeg_with_progress(cmd, eff_duration, src.name, show_progress, progress_cb)
+            new_bytes = tmp_dst.stat().st_size
+            tmp_dst.replace(dst)
+            return VideoOutcome(src, dst, orig_bytes, new_bytes, "ok", "GIF animasi (12 fps)")
+
+        # 3. Animated WebP sticker/clip mode
+        if mode == "webp_anim":
+            if "libwebp" not in AVAILABLE_ENCODERS:
+                raise RuntimeError("Encoder WebP animasi tidak tersedia")
+            base_vf = build_base_vf_list(info, VideoConfig(**{**cfg.__dict__, "max_height": 0, "max_fps": 0}))
+            webp_vf = ",".join([*base_vf, "fps=12,scale='min(iw,512)':-2:flags=lanczos"])
+            out_name = f"{src.stem}.webp"
+            dst = (src.parent / out_name) if cfg.overwrite else (dst_dir / out_name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dst = dst.with_name(f".{dst.stem}.tmp.webp")
+            cmd = [
+                *trim_args, "-i", str(src),
+                "-vf", webp_vf,
+                "-c:v", "libwebp", "-lossless", "0", "-compression_level", "4", "-q:v", "75",
+                "-loop", "0", "-an",
+                str(tmp_dst),
+            ]
+            run_ffmpeg_with_progress(cmd, eff_duration, src.name, show_progress, progress_cb)
+            new_bytes = tmp_dst.stat().st_size
+            tmp_dst.replace(dst)
+            return VideoOutcome(src, dst, orig_bytes, new_bytes, "ok", "WebP animasi (12 fps)")
+
+        # 4. Standard HD video compression
+        vf_list = build_base_vf_list(info, cfg)
+        vf = ",".join(vf_list) if vf_list else None
         audio_args, audio_kbps = build_audio_args(info, cfg)
         ext = codec_extension(cfg.codec)
         same_ext = src.suffix.lower() == ext
@@ -327,14 +401,8 @@ def compress_one(
                 )
                 pass1 = [*common_in, *vf_args, *v_args, *p1_extra, "-an", "-f", "null", os.devnull]
                 pass2 = [
-                    *common_in,
-                    *vf_args,
-                    *v_args,
-                    *p2_extra,
-                    *audio_args,
-                    *meta_args,
-                    *mux_args,
-                    str(tmp_dst),
+                    *common_in, *vf_args, *v_args, *p2_extra,
+                    *audio_args, *meta_args, *mux_args, str(tmp_dst),
                 ]
                 cb1 = (lambda p, s: progress_cb(p * 0.45, s)) if progress_cb else None
                 cb2 = (lambda p, s: progress_cb(45.0 + p * 0.55, s)) if progress_cb else None
@@ -349,6 +417,8 @@ def compress_one(
 
         if cfg.max_height > 0:
             note += f" (maks {cfg.max_height}p)"
+        if abs(spd - 1.0) > 0.01:
+            note += f" {spd:g}x"
         if trim_args:
             note += " + dipotong"
 

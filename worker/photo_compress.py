@@ -49,6 +49,8 @@ class CompressConfig:
     quality: int = 85
     target_kb: int = 0  # 0 = off, >0 = binary search quality to fit target KB
     max_side: int = 0  # 0 = keep original resolution
+    crop_ratio: str = "orig"  # orig | 9:16 | 1:1 | 16:9 | 4:5
+    rotate_deg: int = 0  # 0 | 90 | 180 | 270 clockwise
     resample: str = "mks2021" if "mks2021" in RESAMPLE_FILTERS else "lanczos"
     sharpen_after_resize: bool = True
     jpeg_subsampling: str = "4:2:0"  # 4:4:4 (tajam teks/merah) | 4:2:0 (lebih kecil)
@@ -115,6 +117,37 @@ def flatten_for_jpeg(im: Image.Image) -> Image.Image:
     bg = Image.new("RGB", rgba.size, (255, 255, 255))
     bg.paste(rgba, mask=rgba.getchannel("A"))
     return bg
+
+
+def apply_photo_transforms(im: Image.Image, cfg: CompressConfig) -> tuple[Image.Image, bool]:
+    changed = False
+    deg = int(cfg.rotate_deg or 0) % 360
+    if deg == 90:
+        im = im.transpose(Image.Transpose.ROTATE_270)
+        changed = True
+    elif deg == 180:
+        im = im.transpose(Image.Transpose.ROTATE_180)
+        changed = True
+    elif deg == 270:
+        im = im.transpose(Image.Transpose.ROTATE_90)
+        changed = True
+
+    ratios = {"9:16": 9 / 16, "1:1": 1.0, "16:9": 16 / 9, "4:5": 4 / 5}
+    target = ratios.get(cfg.crop_ratio or "orig")
+    if target:
+        w, h = im.size
+        cur = w / h
+        if abs(cur - target) > 0.01:
+            if cur > target:
+                new_w = max(1, round(h * target))
+                left = (w - new_w) // 2
+                im = im.crop((left, 0, left + new_w, h))
+            else:
+                new_h = max(1, round(w / target))
+                top = (h - new_h) // 2
+                im = im.crop((0, top, w, top + new_h))
+            changed = True
+    return im, changed
 
 
 def downscale_image(im: Image.Image, cfg: CompressConfig) -> tuple[Image.Image, bool]:
@@ -252,7 +285,9 @@ def compress_one(src: Path, dst_dir: Path | None, cfg: CompressConfig) -> ImageO
             im.load()
 
         fmt = resolve_format(src, cfg.output_format)
+        im, was_transformed = apply_photo_transforms(im, cfg)
         im, was_resized = downscale_image(im, cfg)
+        was_resized = was_resized or was_transformed
 
         if cfg.target_kb > 0:
             payload, used_q = encode_with_target_kb(im, fmt, cfg, icc_profile, exif_bytes)
