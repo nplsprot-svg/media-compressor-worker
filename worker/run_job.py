@@ -71,7 +71,7 @@ def run_job(job_id: str) -> None:
         opts = job.get("options") or {}
         mode = job["mode"]
         input_key = job["inputKey"]
-        filename = Path(input_key).name
+        filename = Path(job.get("filename") or input_key).name
 
         with tempfile.TemporaryDirectory(prefix=f"job_{job_id}_") as td:
             work = Path(td)
@@ -126,10 +126,12 @@ def run_job(job_id: str) -> None:
             output_key = f"jobs/{job_id}/output/{out_name}"
             s3.upload_file(str(outcome.dst), bucket, output_key)
 
-            try:
-                s3.delete_object(Bucket=bucket, Key=input_key)
-            except Exception:
-                pass
+            # Keep cached input under jobs/cache/ so same file reuses cache until 1-day B2 lifecycle expires.
+            if not input_key.startswith("jobs/cache/"):
+                try:
+                    s3.delete_object(Bucket=bucket, Key=input_key)
+                except Exception:
+                    pass
 
             job.update(
                 {
