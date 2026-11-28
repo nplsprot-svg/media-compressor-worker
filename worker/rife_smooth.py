@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI RIFE v4.17 Lite (ONNX) 60fps Video Frame Interpolator with automatic scene-cut detection."""
+"""AI RIFE (ONNX) 60fps Video Frame Interpolator supporting RIFE v4.17 Lite (fast) and RIFE v4.9 Ensemble (max quality)."""
 
 from pathlib import Path
 import math
@@ -13,25 +13,36 @@ import onnxruntime as ort
 WEIGHTS_DIR = Path(os.environ.get("AI_WEIGHTS_DIR", str(Path.home() / ".cache" / "ai_weights_rife")))
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-RIFE_FILENAME = "rife-v4.17-lite.onnx"
-RIFE_URL = "https://huggingface.co/archgod94/tellcue-models/resolve/main/rife-v4.17-lite.onnx"
+RIFE_MODELS = {
+    "fast": {
+        "filename": "rife-v4.17-lite.onnx",
+        "url": "https://huggingface.co/archgod94/tellcue-models/resolve/main/rife-v4.17-lite.onnx",
+        "label": "AI RIFE 60fps",
+    },
+    "max": {
+        "filename": "rife49_ensemble_True_scale_1_sim.onnx",
+        "url": "https://huggingface.co/yuvraj108c/rife-onnx/resolve/main/rife49_ensemble_True_scale_1_sim.onnx",
+        "label": "AI RIFE Ensemble 60fps",
+    },
+}
 SCENE_CUT_THRESHOLD = 0.22
 
 
-def ensure_rife_model() -> Path:
-    dest = WEIGHTS_DIR / RIFE_FILENAME
+def ensure_rife_model(quality: str = "fast") -> tuple[Path, str]:
+    spec = RIFE_MODELS.get(quality, RIFE_MODELS["fast"])
+    dest = WEIGHTS_DIR / spec["filename"]
     if dest.exists() and dest.stat().st_size > 5_000_000:
-        return dest
+        return dest, spec["label"]
     tmp = dest.with_suffix(".tmp")
-    req = urllib.request.Request(RIFE_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as out:
+    req = urllib.request.Request(spec["url"], headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=240) as resp, open(tmp, "wb") as out:
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
     tmp.replace(dest)
-    return dest
+    return dest, spec["label"]
 
 
 def _pad_to_mult(arr_chw: np.ndarray, mult: int) -> tuple[np.ndarray, int, int]:
@@ -45,7 +56,6 @@ def _pad_to_mult(arr_chw: np.ndarray, mult: int) -> tuple[np.ndarray, int, int]:
 
 
 def _is_scene_cut(f0_u8: np.ndarray, f1_u8: np.ndarray) -> bool:
-    # Fast strided luma-like MAD check (~0.1 ms) to avoid morphing glitches on hard scene cuts/flashes.
     s0 = f0_u8[::8, ::8, :].astype(np.float32)
     s1 = f1_u8[::8, ::8, :].astype(np.float32)
     mad = float(np.mean(np.abs(s1 - s0))) / 255.0
@@ -66,27 +76,28 @@ def interpolate_video_60fps(
     extra_mux_args: list[str],
     ffmpeg_bin: str = "ffmpeg",
     progress_cb=None,
-) -> None:
-    """Decode pre-filtered frames -> RIFE v4.17 Lite 60fps -> pipe straight into FFmpeg encoder with audio."""
-    model_path = ensure_rife_model()
+    rife_quality: str = "fast",
+) -> str:
+    """Decode pre-filtered frames -> AI RIFE 60fps -> pipe straight into FFmpeg encoder with audio."""
+    model_path, label = ensure_rife_model(rife_quality)
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     sess = ort.InferenceSession(str(model_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
 
-    in_img0 = sess.get_inputs()[0].name
-    in_img1 = sess.get_inputs()[1].name
-    in_ts = sess.get_inputs()[2].name
-    in_scale = sess.get_inputs()[3].name
+    inputs = sess.get_inputs()
+    in_img0 = inputs[0].name
+    in_img1 = inputs[1].name
+    in_ts = inputs[2].name
+    has_scale = len(inputs) >= 4
+    in_scale = inputs[3].name if has_scale else None
     out_name = sess.get_outputs()[0].name
 
     dst_fps = 60.0
     eff_fps = src_fps if src_fps > 1.0 else 30.0
-    # Use scale=0.5 for >=720p (wider motion field + faster), scale=1.0 for smaller clips.
-    flow_scale = 0.5 if max(width, height) >= 720 else 1.0
-    pad_mult = int(round(32.0 / flow_scale))
+    flow_scale = 0.5 if (has_scale and max(width, height) >= 720) else 1.0
+    pad_mult = int(round(32.0 / flow_scale)) if has_scale else 32
     scale_arr = np.array([flow_scale], dtype=np.float32)
 
-    # Probe exact post-filter dimensions (handles rotate/crop/max_height cleanly)
     dec_vf = list(pre_vf)
     dec_cmd = [ffmpeg_bin, "-hide_banner", "-v", "error", *trim_args, "-i", str(src_path)]
     if dec_vf:
@@ -151,7 +162,7 @@ def interpolate_video_60fps(
         if curr_u8 is None:
             enc_proc.stdin.write(prev_u8.tobytes())
         else:
-            in_idx = 0  # prev_u8 is frame[in_idx], curr_u8 is frame[in_idx + 1]
+            in_idx = 0
             out_idx = 0
             while True:
                 pos = out_idx * eff_fps / dst_fps
@@ -167,7 +178,6 @@ def interpolate_video_60fps(
                     in_idx += 1
 
                 if target_idx > in_idx:
-                    # Emit final frame and finish
                     enc_proc.stdin.write(curr_u8.tobytes())
                     break
 
@@ -183,18 +193,18 @@ def interpolate_video_60fps(
                     if curr_t is None:
                         curr_t = to_tensor(curr_u8)
                     ts_arr = np.array([alpha], dtype=np.float32)
-                    pred = sess.run(
-                        [out_name],
-                        {in_img0: prev_t, in_img1: curr_t, in_ts: ts_arr, in_scale: scale_arr},
-                    )[0][0]
+                    feed = {in_img0: prev_t, in_img1: curr_t, in_ts: ts_arr}
+                    if has_scale and in_scale:
+                        feed[in_scale] = scale_arr
+                    pred = sess.run([out_name], feed)[0][0]
                     pred_hwc = np.transpose(pred[:, :height, :width], (1, 2, 0))
                     out_u8 = np.clip(pred_hwc * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     enc_proc.stdin.write(out_u8.tobytes())
 
                 out_idx += 1
-                if progress_cb and (out_idx % 4 == 0):
+                if progress_cb and (out_idx % 2 == 0):
                     pct = min(98.0, (out_idx / est_out_frames) * 100.0)
-                    progress_cb(pct, "AI RIFE 60fps")
+                    progress_cb(pct, label)
     finally:
         if enc_proc.stdin:
             try:
@@ -215,3 +225,4 @@ def interpolate_video_60fps(
         raise RuntimeError(f"Decode video gagal: {dec_err[-240:]}")
     if enc_rc != 0:
         raise RuntimeError(f"Encode 60fps gagal: {enc_err[-240:]}")
+    return label

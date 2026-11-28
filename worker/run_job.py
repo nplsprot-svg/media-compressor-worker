@@ -75,6 +75,7 @@ def process_item(src_path: Path, out_dir: Path, mode: str, opts: dict, progress_
             max_height=int(opts.get("maxHeight", 0)),
             max_fps=int(opts.get("maxFps", 0)),
             smooth_60fps=bool(opts.get("smooth60fps", False)),
+            smooth_60fps_quality=str(opts.get("smooth60Quality", "fast")),
             audio_mode=str(opts.get("audioMode", "aac96")),
             trim_start=str(opts.get("trimStart", "")),
             trim_end=str(opts.get("trimEnd", "")),
@@ -105,7 +106,7 @@ def run_job(job_id: str) -> None:
     def handle_sigterm(_signum, _frame):
         job.update({
             "status": "error",
-            "error": "Proses melebihi batas waktu server (45 menit). Coba pilih tingkat optimasi Cepat/Seimbang atau batas resolusi 1080p/720p.",
+            "error": "Proses melebihi batas waktu server (120 menit). Coba pilih tingkat optimasi Cepat/Seimbang atau batas resolusi 1080p/720p.",
         })
         try:
             write_status(s3, bucket, job_id, job)

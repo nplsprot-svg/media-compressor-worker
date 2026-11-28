@@ -49,6 +49,7 @@ class VideoConfig:
     max_height: int = 0
     max_fps: int = 0
     smooth_60fps: bool = False
+    smooth_60fps_quality: str = "fast"
     audio_mode: str = "aac96"
     trim_start: str = ""
     trim_end: str = ""
@@ -416,7 +417,7 @@ def compress_one(
                 if (cfg.target_mb > 0 and eff_duration > 0)
                 else build_video_codec_args(cfg)
             )
-            rife_smooth.interpolate_video_60fps(
+            rife_label = rife_smooth.interpolate_video_60fps(
                 src_path=src,
                 dst_path=tmp_dst,
                 width=out_w,
@@ -430,6 +431,7 @@ def compress_one(
                 extra_mux_args=[*meta_args, *mux_args],
                 ffmpeg_bin=FFMPEG_BIN,
                 progress_cb=progress_cb,
+                rife_quality=cfg.smooth_60fps_quality,
             )
             note = f"{cfg.codec.upper()} HD"
         elif cfg.target_mb > 0 and eff_duration > 0:
@@ -469,7 +471,7 @@ def compress_one(
         if abs(spd - 1.0) > 0.01:
             note += f" {spd:g}x"
         if cfg.smooth_60fps:
-            note += " + AI RIFE 60fps" if use_rife else " (sudah 60fps)"
+            note += f" + {rife_label}" if use_rife else " (sudah 60fps)"
         if trim_args:
             note += " + dipotong"
 

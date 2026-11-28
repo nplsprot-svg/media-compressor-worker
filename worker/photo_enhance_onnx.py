@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Unlimited CPU ONNX Photo HD Enhancer: Selective Structure-Tensor FXAA + 4x-UltraSharp (Full RRDBNet) + Subtle LAB Clarity."""
+"""Unlimited CPU ONNX Photo HD Enhancer: Selective Structure-Tensor FXAA + 4x-UltraSharp / 4x-UltraSharpV2 Full (DAT2) + Subtle LAB Clarity."""
 
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import json
 import os
+import signal
+import sys
 import tempfile
 import urllib.request
 
@@ -19,8 +21,18 @@ from PIL import Image, ImageOps
 WEIGHTS_DIR = Path(os.environ.get("AI_WEIGHTS_DIR", str(Path.home() / ".cache" / "ai_weights_onnx")))
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_FILENAME = "4x-UltraSharp-fp32-opset17.onnx"
-MODEL_URL = "https://huggingface.co/Kim2091/UltraSharp/resolve/main/ONNX/4x-UltraSharp-fp32-opset17.onnx"
+ONNX_MODELS = {
+    "ultrasharp_aa": {
+        "filename": "4x-UltraSharp-fp32-opset17.onnx",
+        "url": "https://huggingface.co/Kim2091/UltraSharp/resolve/main/ONNX/4x-UltraSharp-fp32-opset17.onnx",
+        "label": "UltraSharp Pro",
+    },
+    "ultrasharp_v2_max": {
+        "filename": "4x-UltraSharpV2_fp32_op17.onnx",
+        "url": "https://huggingface.co/Kim2091/UltraSharpV2/resolve/main/4x-UltraSharpV2_fp32_op17.onnx",
+        "label": "UltraSharp V2 Max",
+    },
+}
 
 
 def make_s3_client():
@@ -47,20 +59,21 @@ def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
     )
 
 
-def ensure_model() -> Path:
-    dest = WEIGHTS_DIR / MODEL_FILENAME
+def ensure_model(style: str) -> tuple[Path, str]:
+    spec = ONNX_MODELS.get(style, ONNX_MODELS["ultrasharp_aa"])
+    dest = WEIGHTS_DIR / spec["filename"]
     if dest.exists() and dest.stat().st_size > 10_000_000:
-        return dest
+        return dest, spec["label"]
     tmp = dest.with_suffix(".tmp")
-    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as out:
+    req = urllib.request.Request(spec["url"], headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=240) as resp, open(tmp, "wb") as out:
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
     tmp.replace(dest)
-    return dest
+    return dest, spec["label"]
 
 
 def fxaa_pass(rgb_u8: np.ndarray, span_max: float = 9.0, reduce_mul: float = 1.0 / 8.0, reduce_min: float = 1.0 / 128.0) -> np.ndarray:
@@ -194,8 +207,19 @@ def run_job(job_id: str) -> None:
     job.update({"status": "processing", "progress": 10, "speed": ""})
     write_status(s3, bucket, job_id, job)
 
+    def handle_sigterm(_signum, _frame):
+        job.update({"status": "error", "error": "Proses HD foto melebihi batas waktu server (30 menit). Coba gunakan mode UltraSharp Pro."})
+        try:
+            write_status(s3, bucket, job_id, job)
+        except Exception:
+            pass
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
     try:
         opts = job.get("options") or {}
+        style = str(opts.get("style", "ultrasharp_aa")).lower()
         req_scale = int(opts.get("scale", 2))
         if req_scale not in (1, 2, 4):
             req_scale = 2
@@ -208,7 +232,7 @@ def run_job(job_id: str) -> None:
         in_key = item["inputKey"]
         orig_name = Path(item.get("filename") or in_key).name
 
-        model_path = ensure_model()
+        model_path, label = ensure_model(style)
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess = ort.InferenceSession(str(model_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
@@ -244,12 +268,13 @@ def run_job(job_id: str) -> None:
             def on_tile(done_t: int, total_t: int) -> None:
                 nonlocal last_pct
                 pct = 22 + int((done_t / max(1, total_t)) * 68)
-                if pct >= last_pct + 8 or done_t == total_t:
+                if pct >= last_pct + 6 or done_t == total_t:
                     last_pct = pct
                     job.update({"progress": pct})
                     write_status(s3, bucket, job_id, job)
 
-            out_img = upscale_onnx_tiled(pre_rgb, sess, on_tile=on_tile)
+            tile_size = 224 if style == "ultrasharp_v2_max" else 256
+            out_img = upscale_onnx_tiled(pre_rgb, sess, on_tile=on_tile, tile=tile_size)
             if out_img.size != (target_w, target_h):
                 out_img = out_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
@@ -277,7 +302,7 @@ def run_job(job_id: str) -> None:
                     "outputName": out_name,
                     "origBytes": orig_bytes,
                     "newBytes": new_bytes,
-                    "detail": f"UltraSharp Pro {req_scale}x ({out_img.width}x{out_img.height})",
+                    "detail": f"{label} {req_scale}x ({out_img.width}x{out_img.height})",
                     "isAudioOnly": False,
                     "isAnimatedImage": False,
                 }
