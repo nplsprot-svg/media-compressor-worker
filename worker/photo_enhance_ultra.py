@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Ultra AI Photo Enhancer worker calling Hugging Face ZeroGPU Diffusion (Finegrain Image Enhancer)."""
+"""Ultra AI Photo Enhancer worker using InvSR (Diffusion Restoration on ZeroGPU) with Finegrain fallback."""
 
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import json
 import os
-import shutil
 import tempfile
 
 import boto3
 from botocore.config import Config
 from gradio_client import Client, handle_file
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
-SPACE_ID = "finegrain/finegrain-image-enhancer"
+INVSR_SPACE = "OAOA/InvSR"
+FINEGRAIN_SPACE = "finegrain/finegrain-image-enhancer"
 
 
 def make_s3_client():
@@ -42,20 +42,56 @@ def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
 
 
 def extract_output_path(result) -> Path:
-    # Gradio ImageSlider or tuple returns [before, after] or (before, after) or single path/dict
-    candidate = result
+    candidates = []
     if isinstance(result, (list, tuple)):
-        candidate = result[-1] if len(result) > 0 else None
-        if isinstance(candidate, (list, tuple)) and len(candidate) > 0:
-            candidate = candidate[-1]
-    if isinstance(candidate, dict):
-        candidate = candidate.get("path") or candidate.get("url")
-    if not candidate or not isinstance(candidate, str):
-        raise RuntimeError(f"Format output tidak dikenali: {type(result)}")
-    p = Path(candidate)
-    if not p.exists():
-        raise RuntimeError(f"File hasil tidak ditemukan: {p}")
-    return p
+        for item in result:
+            if isinstance(item, (list, tuple)):
+                candidates.extend(item)
+            else:
+                candidates.append(item)
+    else:
+        candidates.append(result)
+
+    for item in reversed(candidates):
+        path_str = item.get("path") or item.get("url") if isinstance(item, dict) else item
+        if isinstance(path_str, str):
+            p = Path(path_str)
+            if p.exists() and p.is_file():
+                return p
+    raise RuntimeError(f"Format output tidak dikenali: {type(result)}")
+
+
+def run_invsr(prep_path: Path, hf_token: str | None) -> Path:
+    client = Client(INVSR_SPACE, token=hf_token)
+    res = client.predict(
+        in_path=handle_file(str(prep_path)),
+        num_steps=3,
+        chopping_size=128,
+        seed=12345,
+        api_name="/predict",
+    )
+    return extract_output_path(res)
+
+
+def run_finegrain(prep_path: Path, gpu_upscale: int, hf_token: str | None) -> Path:
+    client = Client(FINEGRAIN_SPACE, token=hf_token)
+    res = client.predict(
+        input_image=handle_file(str(prep_path)),
+        prompt="sharp focus, clean anti-aliased edges, faithful high resolution restoration",
+        negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, lowres",
+        seed=42,
+        upscale_factor=gpu_upscale,
+        controlnet_scale=0.84,
+        controlnet_decay=1.0,
+        condition_scale=4.2,
+        tile_width=112,
+        tile_height=144,
+        denoise_strength=0.23,
+        num_inference_steps=20,
+        solver="DDIM",
+        api_name="/process",
+    )
+    return extract_output_path(res)
 
 
 def run_job(job_id: str) -> None:
@@ -89,7 +125,6 @@ def run_job(job_id: str) -> None:
             s3.download_file(bucket, in_key, str(src_path))
             orig_bytes = src_path.stat().st_size
 
-            # Normalize EXIF orientation & keep input <= 1280px so Diffusion GPU runs fast & crisp
             with Image.open(src_path) as opened:
                 icc = opened.info.get("icc_profile")
                 pil_img = ImageOps.exif_transpose(opened).convert("RGB")
@@ -98,48 +133,41 @@ def run_job(job_id: str) -> None:
             target_w = orig_w * req_scale
             target_h = orig_h * req_scale
 
+            # InvSR natively upscales 4x; pre-scaling to ~0.78x (capped at 768px) melts 2-3px game jaggies
+            # before 4x diffusion restoration, then Lanczos supersamples cleanly to target 1x/2x/4x.
             prep_img = pil_img
-            if max(prep_img.size) > 1280:
-                ratio = 1280 / max(prep_img.size)
+            max_prep = 768
+            if max(prep_img.size) > max_prep:
+                ratio = max_prep / max(prep_img.size)
                 prep_img = prep_img.resize(
                     (max(64, round(prep_img.width * ratio)), max(64, round(prep_img.height * ratio))),
-                    Image.Resampling.LANCZOS,
+                    Image.Resampling.HAMMING,
                 )
-            # Micro pre-AA softens 1px stair-step jaggies (umbrella/pants edges) before ControlNet locks geometry.
-            aa_w = max(64, round(prep_img.width * 0.88))
-            aa_h = max(64, round(prep_img.height * 0.88))
-            prep_img = prep_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
-            prep_img = prep_img.filter(ImageFilter.GaussianBlur(radius=0.45))
+            else:
+                prep_img = prep_img.resize(
+                    (max(64, round(prep_img.width * 0.78)), max(64, round(prep_img.height * 0.78))),
+                    Image.Resampling.HAMMING,
+                )
+
             prep_path = work / "input_prep.png"
             prep_img.save(prep_path, format="PNG")
 
             job.update({"progress": 35})
             write_status(s3, bucket, job_id, job)
 
-            # Always diffuse at 2x (or 4x if requested), then supersample cleanly to target_w x target_h
-            gpu_upscale = 4 if req_scale == 4 else 2
-            client = Client(SPACE_ID, token=hf_token)
-            res = client.predict(
-                input_image=handle_file(str(prep_path)),
-                prompt="sharp focus, clean anti-aliased edges, faithful high resolution restoration",
-                negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, hallucinated objects, lowres",
-                seed=42,
-                upscale_factor=gpu_upscale,
-                controlnet_scale=0.84,
-                controlnet_decay=1.0,
-                condition_scale=4.2,
-                tile_width=112,
-                tile_height=144,
-                denoise_strength=0.23,
-                num_inference_steps=20,
-                solver="DDIM",
-                api_name="/process",
-            )
+            engine_label = "Ultra AI"
+            try:
+                raw_out = run_invsr(prep_path, hf_token)
+            except Exception as inv_err:
+                if "quota" in str(inv_err).lower() or "exceeded" in str(inv_err).lower():
+                    raise
+                gpu_upscale = 4 if req_scale == 4 else 2
+                raw_out = run_finegrain(prep_path, gpu_upscale, hf_token)
+                engine_label = "Ultra AI (Alt)"
 
             job.update({"progress": 85})
             write_status(s3, bucket, job_id, job)
 
-            raw_out = extract_output_path(res)
             with Image.open(raw_out) as enhanced:
                 out_img = enhanced.convert("RGB")
                 if out_img.size != (target_w, target_h):
@@ -167,7 +195,7 @@ def run_job(job_id: str) -> None:
                     "outputName": out_name,
                     "origBytes": orig_bytes,
                     "newBytes": new_bytes,
-                    "detail": f"Ultra AI {req_scale}x ({out_img.width}x{out_img.height})",
+                    "detail": f"{engine_label} {req_scale}x ({out_img.width}x{out_img.height})",
                     "isAudioOnly": False,
                     "isAnimatedImage": False,
                 }
