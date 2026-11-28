@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Ultra AI Photo Enhancer worker calling Hugging Face ZeroGPU Diffusion (Finegrain Image Enhancer)."""
+"""GPU AI Photo Enhancer worker supporting AuraSR-v2 (GigaGAN) and Finegrain Image Enhancer."""
 
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import json
 import os
-import shutil
 import tempfile
 
 import boto3
@@ -14,7 +13,8 @@ from botocore.config import Config
 from gradio_client import Client, handle_file
 from PIL import Image, ImageFilter, ImageOps
 
-SPACE_ID = "finegrain/finegrain-image-enhancer"
+AURASR_SPACE = "gokaygokay/AuraSR-v2"
+FINEGRAIN_SPACE = "finegrain/finegrain-image-enhancer"
 
 
 def make_s3_client():
@@ -58,6 +58,62 @@ def extract_output_path(result) -> Path:
     return p
 
 
+def run_aurasr(pil_img: Image.Image, work: Path, hf_token: str | None) -> Path:
+    prep_img = pil_img
+    if max(prep_img.size) > 1024:
+        ratio = 1024 / max(prep_img.size)
+        prep_img = prep_img.resize(
+            (max(64, round(prep_img.width * ratio)), max(64, round(prep_img.height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+    prep_path = work / "input_aurasr.png"
+    prep_img.save(prep_path, format="PNG")
+
+    client = Client(AURASR_SPACE, token=hf_token)
+    res = client.predict(
+        input_image=handle_file(str(prep_path)),
+        api_name="/process_image",
+    )
+    return extract_output_path(res)
+
+
+def run_finegrain(pil_img: Image.Image, req_scale: int, work: Path, hf_token: str | None) -> Path:
+    prep_img = pil_img
+    if max(prep_img.size) > 1280:
+        ratio = 1280 / max(prep_img.size)
+        prep_img = prep_img.resize(
+            (max(64, round(prep_img.width * ratio)), max(64, round(prep_img.height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+    # Micro pre-AA softens 1px stair-step jaggies before ControlNet locks geometry.
+    aa_w = max(64, round(prep_img.width * 0.88))
+    aa_h = max(64, round(prep_img.height * 0.88))
+    prep_img = prep_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
+    prep_img = prep_img.filter(ImageFilter.GaussianBlur(radius=0.45))
+    prep_path = work / "input_prep.png"
+    prep_img.save(prep_path, format="PNG")
+
+    gpu_upscale = 4 if req_scale == 4 else 2
+    client = Client(FINEGRAIN_SPACE, token=hf_token)
+    res = client.predict(
+        input_image=handle_file(str(prep_path)),
+        prompt="sharp focus, clean anti-aliased edges, faithful high resolution restoration",
+        negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, hallucinated objects, lowres",
+        seed=42,
+        upscale_factor=gpu_upscale,
+        controlnet_scale=0.84,
+        controlnet_decay=1.0,
+        condition_scale=4.2,
+        tile_width=112,
+        tile_height=144,
+        denoise_strength=0.23,
+        num_inference_steps=20,
+        solver="DDIM",
+        api_name="/process",
+    )
+    return extract_output_path(res)
+
+
 def run_job(job_id: str) -> None:
     bucket = os.environ["S3_BUCKET"]
     hf_token = os.environ.get("HF_TOKEN", "").strip() or None
@@ -71,6 +127,7 @@ def run_job(job_id: str) -> None:
 
     try:
         opts = job.get("options") or {}
+        style = str(opts.get("style", "aurasr")).lower()
         req_scale = int(opts.get("scale", 2))
         if req_scale not in (1, 2, 4):
             req_scale = 2
@@ -89,7 +146,6 @@ def run_job(job_id: str) -> None:
             s3.download_file(bucket, in_key, str(src_path))
             orig_bytes = src_path.stat().st_size
 
-            # Normalize EXIF orientation & keep input <= 1280px so Diffusion GPU runs fast & crisp
             with Image.open(src_path) as opened:
                 icc = opened.info.get("icc_profile")
                 pil_img = ImageOps.exif_transpose(opened).convert("RGB")
@@ -98,48 +154,19 @@ def run_job(job_id: str) -> None:
             target_w = orig_w * req_scale
             target_h = orig_h * req_scale
 
-            prep_img = pil_img
-            if max(prep_img.size) > 1280:
-                ratio = 1280 / max(prep_img.size)
-                prep_img = prep_img.resize(
-                    (max(64, round(prep_img.width * ratio)), max(64, round(prep_img.height * ratio))),
-                    Image.Resampling.LANCZOS,
-                )
-            # Micro pre-AA softens 1px stair-step jaggies (umbrella/pants edges) before ControlNet locks geometry.
-            aa_w = max(64, round(prep_img.width * 0.88))
-            aa_h = max(64, round(prep_img.height * 0.88))
-            prep_img = prep_img.resize((aa_w, aa_h), Image.Resampling.HAMMING)
-            prep_img = prep_img.filter(ImageFilter.GaussianBlur(radius=0.45))
-            prep_path = work / "input_prep.png"
-            prep_img.save(prep_path, format="PNG")
-
             job.update({"progress": 35})
             write_status(s3, bucket, job_id, job)
 
-            # Always diffuse at 2x (or 4x if requested), then supersample cleanly to target_w x target_h
-            gpu_upscale = 4 if req_scale == 4 else 2
-            client = Client(SPACE_ID, token=hf_token)
-            res = client.predict(
-                input_image=handle_file(str(prep_path)),
-                prompt="sharp focus, clean anti-aliased edges, faithful high resolution restoration",
-                negative_prompt="blurry, jagged edges, aliasing, pixelated, artifacts, distorted text, hallucinated objects, lowres",
-                seed=42,
-                upscale_factor=gpu_upscale,
-                controlnet_scale=0.84,
-                controlnet_decay=1.0,
-                condition_scale=4.2,
-                tile_width=112,
-                tile_height=144,
-                denoise_strength=0.23,
-                num_inference_steps=20,
-                solver="DDIM",
-                api_name="/process",
-            )
+            if style == "ultra_ai":
+                raw_out = run_finegrain(pil_img, req_scale, work, hf_token)
+                label = "Ultra AI"
+            else:
+                raw_out = run_aurasr(pil_img, work, hf_token)
+                label = "AuraSR Pro"
 
             job.update({"progress": 85})
             write_status(s3, bucket, job_id, job)
 
-            raw_out = extract_output_path(res)
             with Image.open(raw_out) as enhanced:
                 out_img = enhanced.convert("RGB")
                 if out_img.size != (target_w, target_h):
@@ -167,7 +194,7 @@ def run_job(job_id: str) -> None:
                     "outputName": out_name,
                     "origBytes": orig_bytes,
                     "newBytes": new_bytes,
-                    "detail": f"Ultra AI {req_scale}x ({out_img.width}x{out_img.height})",
+                    "detail": f"{label} {req_scale}x ({out_img.width}x{out_img.height})",
                     "isAudioOnly": False,
                     "isAnimatedImage": False,
                 }
