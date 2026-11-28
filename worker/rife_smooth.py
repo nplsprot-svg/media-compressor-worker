@@ -77,11 +77,13 @@ def interpolate_video_60fps(
     ffmpeg_bin: str = "ffmpeg",
     progress_cb=None,
     rife_quality: str = "fast",
+    drop_last_frame: bool = False,
 ) -> str:
     """Decode pre-filtered frames -> AI RIFE 60fps -> pipe straight into FFmpeg encoder with audio."""
     model_path, label = ensure_rife_model(rife_quality)
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.intra_op_num_threads = os.cpu_count() or 4
     sess = ort.InferenceSession(str(model_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
 
     inputs = sess.get_inputs()
@@ -178,7 +180,8 @@ def interpolate_video_60fps(
                     in_idx += 1
 
                 if target_idx > in_idx:
-                    enc_proc.stdin.write(curr_u8.tobytes())
+                    if not drop_last_frame:
+                        enc_proc.stdin.write(curr_u8.tobytes())
                     break
 
                 if alpha < 0.02:
