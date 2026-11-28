@@ -192,15 +192,33 @@ def build_base_vf_list(info: VideoInfo, cfg: VideoConfig) -> list[str]:
         spd = max(0.5, min(2.0, spd))
         filters.append(f"setpts=PTS/{spd:.4f}")
 
-    if cfg.smooth_60fps:
-        # Motion-compensated optical flow interpolation to smooth 60fps (skips if already ~60fps).
-        if info.fps <= 0 or info.fps < 55.0:
-            filters.append("minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:mb_size=16:search_param=16")
-    elif cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
+    if not cfg.smooth_60fps and cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
         filters.append(f"fps={cfg.max_fps}")
 
     return filters
 
+
+
+def _compute_filtered_size(info: VideoInfo, cfg: VideoConfig) -> tuple[int, int]:
+    w, h = info.width, info.height
+    deg = int(cfg.rotate_deg or 0) % 360
+    if deg in (90, 270):
+        w, h = h, w
+    ratios = {"9:16": (9, 16), "1:1": (1, 1), "16:9": (16, 9), "4:5": (4, 5)}
+    if cfg.crop_ratio in ratios:
+        rw, rh = ratios[cfg.crop_ratio]
+        new_w = int(min(w, h * rw / rh)) // 2 * 2
+        new_h = int(min(h, w * rh / rw)) // 2 * 2
+        w, h = max(2, new_w), max(2, new_h)
+    if cfg.max_height > 0:
+        mh = cfg.max_height
+        if w > h and h > mh:
+            w = int(round(w * (mh / h))) // 2 * 2
+            h = mh // 2 * 2
+        elif h >= w and w > mh:
+            h = int(round(h * (mh / w))) // 2 * 2
+            w = mh // 2 * 2
+    return max(2, w // 2 * 2), max(2, h // 2 * 2)
 
 def build_audio_args(info: VideoInfo, cfg: VideoConfig) -> tuple[list[str], int]:
     if not info.has_audio or cfg.audio_mode == "mute":
@@ -388,7 +406,33 @@ def compress_one(
         vf_args = ["-vf", vf] if vf else []
         mux_args = ["-movflags", "+faststart"] if (cfg.faststart and ext == ".mp4") else []
 
-        if cfg.target_mb > 0 and eff_duration > 0:
+        use_rife = bool(cfg.smooth_60fps and (info.fps <= 0 or info.fps < 55.0))
+        if use_rife:
+            import rife_smooth
+
+            out_w, out_h = _compute_filtered_size(info, cfg)
+            v_args = (
+                build_video_codec_args(cfg, bitrate_k=max(250, int((cfg.target_mb * 8192 * 0.97) / max(eff_duration, 0.5)) - audio_kbps))
+                if (cfg.target_mb > 0 and eff_duration > 0)
+                else build_video_codec_args(cfg)
+            )
+            rife_smooth.interpolate_video_60fps(
+                src_path=src,
+                dst_path=tmp_dst,
+                width=out_w,
+                height=out_h,
+                src_fps=info.fps * spd if info.fps > 0 else 30.0 * spd,
+                duration=eff_duration,
+                pre_vf=vf_list,
+                trim_args=trim_args,
+                codec_args=v_args,
+                audio_args=audio_args,
+                extra_mux_args=[*meta_args, *mux_args],
+                ffmpeg_bin=FFMPEG_BIN,
+                progress_cb=progress_cb,
+            )
+            note = f"{cfg.codec.upper()} HD"
+        elif cfg.target_mb > 0 and eff_duration > 0:
             total_kbps = int((cfg.target_mb * 8192 * 0.97) / eff_duration)
             video_kbps = max(250, total_kbps - audio_kbps)
             with tempfile.TemporaryDirectory(prefix="vcomp_2pass_") as logdir:
@@ -425,12 +469,12 @@ def compress_one(
         if abs(spd - 1.0) > 0.01:
             note += f" {spd:g}x"
         if cfg.smooth_60fps:
-            note += " + Smooth 60fps"
+            note += " + AI RIFE 60fps" if use_rife else " (sudah 60fps)"
         if trim_args:
             note += " + dipotong"
 
         new_bytes = tmp_dst.stat().st_size
-        if cfg.skip_if_larger and same_ext and vf is None and not trim_args and new_bytes >= orig_bytes:
+        if cfg.skip_if_larger and not use_rife and same_ext and vf is None and not trim_args and new_bytes >= orig_bytes:
             tmp_dst.unlink(missing_ok=True)
             if not cfg.overwrite:
                 shutil.copy2(src, dst)

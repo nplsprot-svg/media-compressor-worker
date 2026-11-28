@@ -21,11 +21,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache AI RIFE model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ai_weights_rife
+          key: onnx-rife-v417-lite-v1
+
       - name: Install FFmpeg and Python dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          pip install --no-cache-dir pillow boto3
+          pip install --no-cache-dir pillow boto3 numpy onnxruntime
 
       - name: Run compression job
         env:
