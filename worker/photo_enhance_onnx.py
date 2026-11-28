@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unlimited CPU ONNX Photo HD Enhancer: Selective Structure-Tensor FXAA + 4x-UltraSharpV2 Lite."""
+"""Unlimited CPU ONNX Photo HD Enhancer: Selective Structure-Tensor FXAA + 4x-UltraSharp (Full RRDBNet) + Subtle LAB Clarity."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +19,8 @@ from PIL import Image, ImageOps
 WEIGHTS_DIR = Path(os.environ.get("AI_WEIGHTS_DIR", str(Path.home() / ".cache" / "ai_weights_onnx")))
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_FILENAME = "4x-UltraSharpV2_Lite_fp32_op17.onnx"
-MODEL_URL = "https://huggingface.co/Kim2091/UltraSharpV2/resolve/main/4x-UltraSharpV2_Lite_fp32_op17.onnx"
+MODEL_FILENAME = "4x-UltraSharp-fp32-opset17.onnx"
+MODEL_URL = "https://huggingface.co/Kim2091/UltraSharp/resolve/main/ONNX/4x-UltraSharp-fp32-opset17.onnx"
 
 
 def make_s3_client():
@@ -49,11 +49,11 @@ def write_status(s3, bucket: str, job_id: str, payload: dict) -> None:
 
 def ensure_model() -> Path:
     dest = WEIGHTS_DIR / MODEL_FILENAME
-    if dest.exists() and dest.stat().st_size > 1_000_000:
+    if dest.exists() and dest.stat().st_size > 10_000_000:
         return dest
     tmp = dest.with_suffix(".tmp")
     req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+    with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as out:
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:
@@ -130,12 +130,26 @@ def selective_edge_aa(rgb_u8: np.ndarray) -> np.ndarray:
 
     angle = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)
     diag_weight = np.clip(np.abs(np.sin(2.0 * angle)) * 2.8, 0.0, 1.0)
-    coh_mask = np.clip((coherence - 0.50) / 0.30, 0.0, 1.0)
+    coh_mask = np.clip((coherence - 0.52) / 0.28, 0.0, 1.0)
     mask = cv2.GaussianBlur(np.clip(coh_mask * diag_weight, 0.0, 1.0), (3, 3), 0.7)[..., None]
 
     aa_img = fxaa_pass(fxaa_pass(rgb_u8, span_max=9.0), span_max=9.0)
     blended = rgb_u8.astype(np.float32) * (1.0 - mask) + aa_img.astype(np.float32) * mask
     return np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+
+
+def subtle_clarity_polish(rgb_u8: np.ndarray) -> np.ndarray:
+    """Clean luminance-only crispness & clarity polish (no harsh contrast, no color shift, no halos)."""
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L = lab[..., 0]
+    blur_fine = cv2.GaussianBlur(L, (0, 0), sigmaX=1.0)
+    detail = np.clip((L - blur_fine) * 0.35, -14.0, 14.0)
+    blur_wide = cv2.GaussianBlur(L, (0, 0), sigmaX=10.0)
+    clarity = np.clip((L - blur_wide) * 0.08, -10.0, 10.0)
+    lab[..., 0] = np.clip(L + detail + clarity, 0.0, 255.0)
+    lab[..., 1] = np.clip(128.0 + (lab[..., 1] - 128.0) * 1.03, 0.0, 255.0)
+    lab[..., 2] = np.clip(128.0 + (lab[..., 2] - 128.0) * 1.03, 0.0, 255.0)
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
 
 
 def upscale_onnx_tiled(rgb_u8: np.ndarray, sess: ort.InferenceSession, on_tile=None, tile: int = 256, pad: int = 16) -> Image.Image:
@@ -209,7 +223,6 @@ def run_job(job_id: str) -> None:
                 icc = opened.info.get("icc_profile")
                 pil_img = ImageOps.exif_transpose(opened).convert("RGB")
 
-            # Keep input bounded so CPU ONNX stays fast even on huge phone photos
             max_input = 1440 if req_scale <= 2 else 1080
             if max(pil_img.size) > max_input:
                 ratio = max_input / max(pil_img.size)
@@ -239,6 +252,8 @@ def run_job(job_id: str) -> None:
             out_img = upscale_onnx_tiled(pre_rgb, sess, on_tile=on_tile)
             if out_img.size != (target_w, target_h):
                 out_img = out_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+            out_img = Image.fromarray(subtle_clarity_polish(np.asarray(out_img)))
 
             suffix = "HD" if req_scale == 1 else f"HD{req_scale}x"
             out_name = f"{src_path.stem}_{suffix}{ext}"
