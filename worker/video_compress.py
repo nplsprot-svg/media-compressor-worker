@@ -195,7 +195,7 @@ def build_base_vf_list(info: VideoInfo, cfg: VideoConfig) -> list[str]:
     if cfg.smooth_60fps:
         # Motion-compensated optical flow interpolation to smooth 60fps (skips if already ~60fps).
         if info.fps <= 0 or info.fps < 55.0:
-            filters.append("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+            filters.append("minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:mb_size=16:search_param=16")
     elif cfg.max_fps > 0 and (info.fps <= 0 or info.fps > cfg.max_fps + 0.5):
         filters.append(f"fps={cfg.max_fps}")
 

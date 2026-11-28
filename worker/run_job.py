@@ -6,6 +6,7 @@ from pathlib import Path
 import argparse
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -100,6 +101,19 @@ def run_job(job_id: str) -> None:
     job = json.loads(raw.decode("utf-8"))
     job.update({"status": "processing", "progress": 2, "speed": ""})
     write_status(s3, bucket, job_id, job)
+
+    def handle_sigterm(_signum, _frame):
+        job.update({
+            "status": "error",
+            "error": "Proses melebihi batas waktu server (45 menit). Coba pilih tingkat optimasi Cepat/Seimbang atau batas resolusi 1080p/720p.",
+        })
+        try:
+            write_status(s3, bucket, job_id, job)
+        except Exception:
+            pass
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
 
     last_push = 0.0
 
